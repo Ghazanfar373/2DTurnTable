@@ -25,13 +25,16 @@ SERVO_LEN = 6
 SERVO_MIN_US = 1000
 SERVO_MAX_US = 2000
 SERVO_CENTER_US = 1500
+# TD8135MG: 500–2500 µs is 180° at the horn, so this pulse span is ±45°.
+US_PER_DEG = 2000.0 / 180.0
+HORN_MIN_DEG = (SERVO_MIN_US - SERVO_CENTER_US) / US_PER_DEG
+HORN_MAX_DEG = (SERVO_MAX_US - SERVO_CENTER_US) / US_PER_DEG
 # Measured pulse widths for the two pitch positions: (servo 1, servo 2).
 PITCH_UP_US = (1620, 1850)
 PITCH_DOWN_US = (1040, 1000)
 # (servo 1 µs, servo 2 µs). Measured the same way as the pitch positions.
 ROLL_LEFT_US = (1000, 1850)
 ROLL_RIGHT_US = (1720, 1000)
-MOVE_SECONDS = 3.0
 BAUD = 115200
 
 BG = "#101418"
@@ -53,6 +56,15 @@ def xor_bytes(data):
     for byte in data:
         value ^= byte
     return value
+
+
+def us_to_deg(pulse_us):
+    return (float(pulse_us) - SERVO_CENTER_US) / US_PER_DEG
+
+
+def deg_to_us(deg):
+    pulse = SERVO_CENTER_US + float(deg) * US_PER_DEG
+    return max(SERVO_MIN_US, min(SERVO_MAX_US, pulse))
 
 
 def servo_packet(servo_id, pulse_us):
@@ -487,12 +499,12 @@ class App(tk.Tk):
         self.reader = None
         self.running = False
         self.io_lock = threading.Lock()
-        self._send_job = None
-        self._slew_job = None
-        self._slew = None
-        self._slew_touch = 0.0
-        self._applying_slew = False
-        self._pending = set()
+        self._step_job = None
+        self._step_t = 0.0
+        self._ignore_slider = False
+        self.goal_us = [SERVO_CENTER_US, SERVO_CENTER_US]
+        self.out_us = [float(SERVO_CENTER_US), float(SERVO_CENTER_US)]
+        self._last_sent = [None, None]
         self._ui_ready = False
 
         stage = tk.Frame(self, bg=BG)
@@ -531,7 +543,7 @@ class App(tk.Tk):
 
         self._section(panel, "Servos")
         tk.Label(
-            panel, text="Pulse width 1000–2000 µs",
+            panel, text="Horn angle, −45° to +45°",
             bg=PANEL, fg=MUTED, font=("Segoe UI", 9),
         ).pack(anchor="w", padx=16, pady=(0, 8))
         self.servo_vars = {}
@@ -539,6 +551,25 @@ class App(tk.Tk):
         self.servo_labels = {}
         for servo_id in (1, 2):
             self._slider(panel, servo_id)
+        tk.Label(
+            panel, text="Move time", bg=PANEL, fg=TEXT, font=("Segoe UI", 11),
+        ).pack(anchor="w", padx=16, pady=(14, 0))
+        self.move_time_var = tk.IntVar(value=8)
+        self.move_time_label = tk.StringVar(value="8 s")
+        tk.Label(
+            panel, textvariable=self.move_time_label, bg=PANEL, fg=ACCENT, font=("Segoe UI", 10),
+        ).pack(anchor="w", padx=16)
+        tk.Scale(
+            panel, from_=2, to=30, orient="horizontal", resolution=1, showvalue=False,
+            variable=self.move_time_var, bg=ACCENT, troughcolor="#0e141b",
+            activebackground="#6cb2ff", highlightthickness=0, bd=0,
+            sliderrelief="flat", sliderlength=22, width=14,
+            command=lambda value: self.move_time_label.set("%s s" % int(float(value))),
+        ).pack(fill="x", padx=16)
+        tk.Label(
+            panel, text="Full horn travel uses this time",
+            bg=PANEL, fg=MUTED, font=("Segoe UI", 9),
+        ).pack(anchor="w", padx=16, pady=(0, 4))
         ttk.Button(panel, text="Center both", command=self.center_servos).pack(fill="x", padx=16, pady=(12, 0))
         ttk.Button(panel, text="Pitch up 5°", command=lambda: self.move_servos_slow(PITCH_UP_US)).pack(fill="x", padx=16, pady=(8, 0))
         ttk.Button(panel, text="Pitch Down 5°", command=lambda: self.move_servos_slow(PITCH_DOWN_US)).pack(fill="x", padx=16, pady=(8, 0))
@@ -574,18 +605,18 @@ class App(tk.Tk):
         tk.Label(
             parent, text="Servo %d" % servo_id, bg=PANEL, fg=TEXT, font=("Segoe UI", 11),
         ).pack(anchor="w", padx=16, pady=(8, 0))
-        variable = tk.IntVar(value=SERVO_CENTER_US)
+        variable = tk.DoubleVar(value=0.0)
         self.servo_vars[servo_id] = variable
-        value = tk.StringVar(value="%d µs" % SERVO_CENTER_US)
+        value = tk.StringVar(value="+0.0°    1500 µs")
         self.servo_labels[servo_id] = value
         tk.Label(parent, textvariable=value, bg=PANEL, fg=ACCENT, font=("Segoe UI", 10)).pack(anchor="w", padx=16)
         scale = tk.Scale(
-            parent, from_=SERVO_MIN_US, to=SERVO_MAX_US, orient="horizontal",
-            resolution=10, showvalue=False, variable=variable,
+            parent, from_=HORN_MIN_DEG, to=HORN_MAX_DEG, orient="horizontal",
+            resolution=0.1, showvalue=False, variable=variable,
             bg=ACCENT, fg=TEXT, troughcolor="#0e141b",
             activebackground="#6cb2ff", highlightthickness=0, bd=0,
             sliderrelief="flat", sliderlength=22, width=14,
-            command=lambda _value, sid=servo_id: self.on_slider(sid),
+            command=lambda value, sid=servo_id: self.on_slider(sid, value),
         )
         scale.pack(fill="x", padx=16)
         self.servo_scales[servo_id] = scale
@@ -667,28 +698,76 @@ class App(tk.Tk):
             self.connect_btn.configure(text="Connect")
             self.status_var.set("Serial link lost")
 
-    def on_slider(self, servo_id):
-        if not self._ui_ready:
+    def on_slider(self, servo_id, value=None):
+        if not self._ui_ready or self._ignore_slider:
             return
-        if self._slew is not None and (time.monotonic() - self._slew_touch) < 0.08:
-            pulse = int(self.servo_vars[servo_id].get())
-            self.servo_labels[servo_id].set("%d µs" % pulse)
+        pulse = self._pulse_from_degrees(value if value is not None else self.servo_vars[servo_id].get())
+        index = servo_id - 1
+        # Button presses set the knob to the goal. A matching callback is not a new drag.
+        if pulse == self.goal_us[index]:
+            self._refresh_servo_label(servo_id)
             return
-        self._cancel_slew()
-        pulse = int(self.servo_vars[servo_id].get())
-        self.servo_labels[servo_id].set("%d µs" % pulse)
-        self._pending.add(servo_id)
-        if self._send_job is None:
-            self._send_job = self.after(40, self._flush_sends)
+        self.goal_us[index] = pulse
+        self._refresh_servo_label(servo_id)
+        self._ensure_stepper()
 
-    def _flush_sends(self):
-        self._send_job = None
-        pending = list(self._pending)
-        self._pending.clear()
-        for servo_id in pending:
-            self._write_servo(servo_id, int(self.servo_vars[servo_id].get()))
-        if self._pending:
-            self._send_job = self.after(40, self._flush_sends)
+    def _pulse_from_degrees(self, degrees):
+        return int(round(deg_to_us(float(degrees))))
+
+    def _refresh_servo_label(self, servo_id):
+        index = servo_id - 1
+        goal = self.goal_us[index]
+        out = self.out_us[index]
+        if abs(out - goal) > 2:
+            text = "%+.1f° -> %+.1f°" % (us_to_deg(out), us_to_deg(goal))
+        else:
+            text = "%+.1f°    %d µs" % (us_to_deg(goal), int(round(goal)))
+        self.servo_labels[servo_id].set(text)
+
+    def _ensure_stepper(self):
+        if self._step_job is None:
+            self._step_t = time.monotonic()
+            self._step_job = self.after(20, self._step_once)
+
+    def _step_once(self):
+        self._step_job = None
+        try:
+            now = time.monotonic()
+            dt = min(0.2, max(0.02, now - self._step_t))
+            self._step_t = now
+            seconds = max(2, int(self.move_time_var.get()))
+            # Full −45°..+45° horn travel takes Move time seconds.
+            rate = (SERVO_MAX_US - SERVO_MIN_US) / float(seconds)
+            advance = rate * dt
+            busy = False
+            for index, servo_id in enumerate((1, 2)):
+                goal = float(self.goal_us[index])
+                current = self.out_us[index]
+                error = goal - current
+                nxt = current + math.copysign(min(abs(error), advance), error)
+                # Finish on the exact pulse instead of a last step inside the deadband.
+                if abs(goal - nxt) < 8:
+                    nxt = goal
+                else:
+                    busy = True
+                self.out_us[index] = nxt
+                self._send_step(servo_id, int(round(nxt)), force=(nxt == goal))
+                self._refresh_servo_label(servo_id)
+            if busy:
+                self._step_job = self.after(20, self._step_once)
+        except Exception as exc:
+            self.status_var.set("Servo move failed: %s" % exc)
+
+    def _send_step(self, servo_id, pulse, force):
+        index = servo_id - 1
+        previous = self._last_sent[index]
+        # TD8135MG ignores pulse changes of about 5 µs, so smaller steps never move.
+        if previous is not None and not force and abs(pulse - previous) < 8:
+            return
+        if pulse == previous:
+            return
+        self._last_sent[index] = pulse
+        self._write_servo(servo_id, pulse)
 
     def _write_servo(self, servo_id, pulse):
         if not self.running or self.serial is None:
@@ -701,64 +780,27 @@ class App(tk.Tk):
             self.after(0, self._on_link_lost)
 
     def center_servos(self):
-        self._cancel_slew()
-        for servo_id, scale in self.servo_scales.items():
-            scale.set(SERVO_CENTER_US)
+        self.move_servos_slow((SERVO_CENTER_US, SERVO_CENTER_US))
 
     def move_servos_slow(self, pulses):
         if not pulses:
             self.status_var.set("Pulse widths for this move are not set yet")
             return
-        self._cancel_slew()
-        start = tuple(int(self.servo_vars[servo_id].get()) for servo_id in (1, 2))
-        target = tuple(
-            max(SERVO_MIN_US, min(SERVO_MAX_US, int(pulse)))
-            for pulse in pulses
-        )
-        self._slew = {"start": start, "target": target, "t0": time.monotonic()}
-        self._slew_step()
-
-    def _show_pulses(self, pulses):
-        self._slew_touch = time.monotonic()
-        self._applying_slew = True
+        self._ignore_slider = True
         try:
-            for servo_id, pulse in zip((1, 2), pulses):
-                self.servo_scales[servo_id].set(int(pulse))
-                self.servo_labels[servo_id].set("%d µs" % int(pulse))
+            for index, (servo_id, pulse) in enumerate(zip((1, 2), pulses)):
+                pulse = max(SERVO_MIN_US, min(SERVO_MAX_US, int(pulse)))
+                self.goal_us[index] = pulse
+                self.servo_scales[servo_id].set(us_to_deg(pulse))
+                self._refresh_servo_label(servo_id)
         finally:
-            self._applying_slew = False
+            self._ignore_slider = False
+        self._ensure_stepper()
 
-    def _slew_step(self):
-        if self._slew is None:
-            return
-        elapsed = time.monotonic() - self._slew["t0"]
-        fraction = min(1.0, elapsed / MOVE_SECONDS)
-        target = self._slew["target"]
-        if fraction >= 1.0:
-            pulses = target
-        else:
-            pulses = []
-            for start, goal in zip(self._slew["start"], target):
-                pulse = start + (goal - start) * fraction
-                pulses.append(int(round(pulse / 10.0) * 10))
-        self._show_pulses(pulses)
-        for servo_id, pulse in zip((1, 2), pulses):
-            self._write_servo(servo_id, int(pulse))
-        if fraction >= 1.0:
-            # Land on the exact pair from the button, not a rounded step.
-            self._show_pulses(target)
-            for servo_id, pulse in zip((1, 2), target):
-                self._write_servo(servo_id, int(pulse))
-            self._slew = None
-            self._slew_job = None
-            return
-        self._slew_job = self.after(100, self._slew_step)
-
-    def _cancel_slew(self):
-        if self._slew_job is not None:
-            self.after_cancel(self._slew_job)
-            self._slew_job = None
-        self._slew = None
+    def _cancel_stepper(self):
+        if self._step_job is not None:
+            self.after_cancel(self._step_job)
+            self._step_job = None
 
     def tick(self):
         pitch, roll, yaw = self.parser.pitch, self.parser.roll, self.parser.yaw
@@ -778,7 +820,7 @@ class App(tk.Tk):
         self.after(33, self.tick)
 
     def on_close(self):
-        self._cancel_slew()
+        self._cancel_stepper()
         self.disconnect()
         self.destroy()
 
